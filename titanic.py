@@ -1,137 +1,141 @@
 
-# =====================================================
 # TITANIC SURVIVAL PREDICTOR
-# Custom Algorithm vs Machine Learning
-# Google Colab Version
-# =====================================================
+# Custom Historical Algorithm + Machine Learning
 
 import pandas as pd
 import numpy as np
 
 from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.impute import SimpleImputer
-from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 
-
-# =====================================================
-# 1. LOAD HISTORICAL TITANIC DATA
-# =====================================================
+# --------------------------------
+# 1. LOAD THE TITANIC DATASET
+# --------------------------------
 
 url = "https://zenodo.org/records/22983324/files/titanic.csv?download=1"
 
 data = pd.read_csv(url)
 
-print("Historical Titanic data loaded!")
-print("Total people:", len(data))
+# Prepare the data
+data["sex"] = data["sex"].astype(str).str.lower().str.strip()
+data["class"] = data["class"].astype(str).str.lower().str.strip()
 
+data["CrewStatus"] = data["class"].eq("crew")
 
-# =====================================================
+data["age"] = pd.to_numeric(data["age"], errors="coerce")
+data["survived"] = pd.to_numeric(data["survived"], errors="coerce")
+
+# Keep usable records
+data = data[
+    data["sex"].isin(["male", "female"]) &
+    data["survived"].isin([0, 1])
+].copy()
+
+# Fill missing ages with the median
+data["age"] = data["age"].fillna(data["age"].median())
+
+# --------------------------------
 # 2. PREPARE THE DATA
-# =====================================================
-
-data["CrewStatus"] = (
-    data["class"].str.lower() == "crew"
-)
+# --------------------------------
 
 X = data[["age", "sex", "CrewStatus"]]
-y = data["survived"]
+y = data["survived"].astype(int)
 
 X_train, X_test, y_train, y_test = train_test_split(
     X,
     y,
-    test_size=0.2,
+    test_size=0.20,
     random_state=42,
     stratify=y
 )
 
-median_age = X_train["age"].median()
+# --------------------------------
+# 3. CUSTOM HISTORICAL ALGORITHM
+# --------------------------------
 
-
-# =====================================================
-# 3. CUSTOM ALGORITHM
-# =====================================================
-
-training_data = X_train.copy()
-
-training_data["survived"] = y_train
-
-training_data["age"] = training_data["age"].fillna(
-    median_age
-)
-
-
-def age_group(age):
-
+def get_age_group(age):
     if age <= 12:
         return "Child"
-
     elif age <= 17:
         return "Teen"
-
     elif age <= 59:
         return "Adult"
-
     else:
         return "Senior"
 
 
-training_data["AgeGroup"] = (
-    training_data["age"].apply(age_group)
+training_data = X_train.copy()
+training_data["survived"] = y_train
+
+training_data["AgeGroup"] = training_data["age"].apply(
+    get_age_group
 )
 
+# Calculate historical survival rates
+global_rate = training_data["survived"].mean()
 
-# Calculate historical survival statistics
-
-group_statistics = training_data.groupby(
+group_stats = training_data.groupby(
     ["AgeGroup", "sex", "CrewStatus"]
-)["survived"].agg(["sum", "count"])
+)["survived"].agg(["mean", "count"])
+
+fallback_stats = training_data.groupby(
+    ["sex", "CrewStatus"]
+)["survived"].agg(["mean", "count"])
 
 
-def custom_predict(age, sex, crew):
+def custom_prediction(age, sex, crew):
+    age_group = get_age_group(age)
 
-    group = age_group(age)
+    key = (age_group, sex, crew)
 
-    key = (group, sex, crew)
-
-    if key in group_statistics.index:
-
-        stats = group_statistics.loc[key]
-
-        survivors = stats["sum"]
-        count = stats["count"]
-
+    if key in group_stats.index:
+        stats = group_stats.loc[key]
+    elif (sex, crew) in fallback_stats.index:
+        stats = fallback_stats.loc[(sex, crew)]
     else:
+        return global_rate
 
-        survivors = 0
-        count = 0
-
-    subgroup = training_data[
-        (training_data["sex"] == sex) &
-        (training_data["CrewStatus"] == crew)
-    ]
-
-    if len(subgroup) > 0:
-
-        prior = subgroup["survived"].mean()
-
-    else:
-
-        prior = training_data["survived"].mean()
+    # Smooth the estimate so small groups
+    # do not produce extreme predictions
+    prior = global_rate
+    survivors = stats["mean"] * stats["count"]
 
     probability = (
         survivors + 10 * prior
-    ) / (count + 10)
+    ) / (
+        stats["count"] + 10
+    )
 
     return probability
 
 
-# =====================================================
+# Test the custom algorithm
+custom_test_predictions = []
+
+for _, row in X_test.iterrows():
+    probability = custom_prediction(
+        row["age"],
+        row["sex"],
+        row["CrewStatus"]
+    )
+
+    custom_test_predictions.append(
+        1 if probability >= 0.5 else 0
+    )
+
+custom_accuracy = accuracy_score(
+    y_test,
+    custom_test_predictions
+)
+
+# --------------------------------
 # 4. MACHINE LEARNING MODEL
-# =====================================================
+# --------------------------------
 
 preprocessor = ColumnTransformer(
     transformers=[
@@ -148,22 +152,14 @@ preprocessor = ColumnTransformer(
     ]
 )
 
-
-model = Pipeline([
-    ("preprocessing", preprocessor),
-
-    ("classifier", LogisticRegression(max_iter=1000))
-])
-
-
-# Train the model
+model = Pipeline(
+    steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", LogisticRegression(max_iter=1000))
+    ]
+)
 
 model.fit(X_train, y_train)
-
-
-# =====================================================
-# 5. TEST BOTH ALGORITHMS
-# =====================================================
 
 ml_predictions = model.predict(X_test)
 
@@ -172,182 +168,96 @@ ml_accuracy = accuracy_score(
     ml_predictions
 )
 
+# --------------------------------
+# 5. DISPLAY MODEL ACCURACY
+# --------------------------------
 
-custom_predictions = []
-
-for _, row in X_test.iterrows():
-
-    age = row["age"]
-
-    if pd.isna(age):
-
-        age = median_age
-
-    probability = custom_predict(
-        age,
-        row["sex"],
-        row["CrewStatus"]
-    )
-
-    custom_predictions.append(
-        int(probability >= 0.5)
-    )
-
-
-custom_accuracy = accuracy_score(
-    y_test,
-    custom_predictions
-)
-
-
-print("\n========== MODEL ACCURACY ==========")
-
-print(
-    "Custom Algorithm:",
-    round(custom_accuracy * 100, 2), "%"
-)
-
-print(
-    "Machine Learning:",
-    round(ml_accuracy * 100, 2), "%"
-)
-
-
-# =====================================================
-# 6. GET USER INFORMATION
-# =====================================================
-
-print("\n====================================")
+print("===================================")
 print("       TITANIC SURVIVAL PREDICTOR")
-print("====================================")
+print("===================================")
 
+print(f"Custom Algorithm Accuracy: {custom_accuracy:.1%}")
+print(f"Machine Learning Accuracy: {ml_accuracy:.1%}")
+
+# --------------------------------
+# 6. GET USER INPUT
+# --------------------------------
+
+print("\nEnter your information below.")
 
 # AGE VALIDATION
-
 while True:
-
     try:
-
-        age = float(input("\nEnter age: "))
+        age = float(input("Enter your age: "))
 
         if 0 <= age <= 100:
-
             break
-
         else:
-
-            print(
-                "Invalid age! Enter an age between 0 and 100."
-            )
+            print("Error: Please enter an age between 0 and 100.")
 
     except ValueError:
-
-        print(
-            "Invalid input! Please enter a number."
-        )
-
+        print("Error: Please enter a valid number.")
 
 # GENDER VALIDATION
-
 while True:
-
-    sex = input(
-        "\nEnter gender (male/female): "
-    ).lower().strip()
+    sex = input("Enter your gender (male/female): ").lower().strip()
 
     if sex in ["male", "female"]:
-
         break
-
     else:
+        print("Error: Please enter male or female.")
 
-        print(
-            "Invalid gender! Please enter male or female."
-        )
-
-
-# CREW VALIDATION
-
+# CREW STATUS VALIDATION
 while True:
-
-    crew_input = input(
-        "\nIs this person crew? (yes/no): "
-    ).lower().strip()
+    crew_input = input("Are you a crew member? (yes/no): ").lower().strip()
 
     if crew_input in ["yes", "no"]:
-
         break
-
     else:
-
-        print(
-            "Invalid answer! Please enter yes or no."
-        )
-
-
-# =====================================================
-# 7. MAKE PREDICTIONS
-# =====================================================
+        print("Error: Please enter yes or no.")
 
 crew = crew_input == "yes"
 
+# --------------------------------
+# 7. MAKE PREDICTIONS
+# --------------------------------
+
+user_data = pd.DataFrame({
+    "age": [age],
+    "sex": [sex],
+    "CrewStatus": [crew]
+})
 
 # Custom algorithm prediction
-
-custom_probability = custom_predict(
+custom_probability = custom_prediction(
     age,
     sex,
     crew
 )
 
-
 # Machine learning prediction
-
-person = pd.DataFrame({
-
-    "age": [age],
-
-    "sex": [sex],
-
-    "CrewStatus": [crew]
-
-})
-
-
 ml_probability = model.predict_proba(
-    person
+    user_data
 )[0][1]
 
-
-# =====================================================
+# --------------------------------
 # 8. DISPLAY RESULTS
-# =====================================================
+# --------------------------------
 
-print("\n====================================")
-print("          PREDICTION RESULTS")
-print("====================================")
-
-print("Age:", age)
-
-print("Gender:", sex.capitalize())
-
-print("Crew member:", "Yes" if crew else "No")
-
-print("------------------------------------")
+print("\n===================================")
+print("          YOUR RESULTS")
+print("===================================")
 
 print(
-    "Custom Algorithm:",
-    round(custom_probability * 100, 2), "%"
+    f"Your survival rate (Custom Algorithm) is: "
+    f"{custom_probability:.1%}"
 )
 
 print(
-    "Machine Learning:",
-    round(ml_probability * 100, 2), "%"
+    f"Your survival rate (Machine Learning) is: "
+    f"{ml_probability:.1%}"
 )
 
-print("====================================")
-
-print(
-    "\nThese are historical statistical estimates, "
-    "not guaranteed individual survival chances."
-)
+print("===================================")
+print("Thank you for using the predictor!")
+print("===================================")
